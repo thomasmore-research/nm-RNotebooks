@@ -1,0 +1,601 @@
+---
+title: EEG Intersubject Correlation (Adapted)
+description: Calculates the correlation across respondents’ EEG signals to assess the reliability of the brain response between respondents
+dependencies:
+  notebooks: 
+    - "EEG Power Spectral Density"
+  sensor: ^EEG|Raw EEG|(?i)Power\s*Bands|ActiCHamp|LSL
+params:
+  token: "xxxxx" 
+  studyId: "xxxxx"
+  stimulusId: "xxxxx"
+  segmentId: "xxxxx"
+  selectedSensorName: ""
+  flowName: "xxxxx"
+  iMotionsVersion: "xxxxx"
+  window_size:
+    label: "Window length [samples] for the Intersubject Correlation."
+    value: 5
+    input: numeric
+    min: 1
+  window_overlap:
+    label: "Window overlap percentage [%] for the Intersubject Correlation."
+    value: 50
+    input: numeric
+    min: 0
+    max: 100 #less than 100
+  quality_threshold:
+    label: "Missing PSD data percentage [%] above which a respondent should be excluded."
+    value: 75
+    input: numeric
+    min: 0
+    max: 100
+  multiple_device:
+   label: "Consider multiple device as different respondents"
+   value: FALSE
+   input: checkbox
+paramDetails:
+  window_overlap:
+    description: "Should be in the 0-100 range."
+  quality_threshold:
+    description: "Should be in the 0-100 range."
+references:
+- id: leeuwis2021
+  accessed:
+    - year: 2023
+      month: 5
+      day: 9
+  author:
+    - family: Leeuwis
+      given: Nikki
+    - family: Pistone
+      given: Daniela
+    - family: Flick
+      given: Niels
+    - family: Bommel
+      given: Tom
+      non-dropping-particle: van
+  container-title: Frontiers in Psychology
+  ISSN: 1664-1078
+  issued:
+    - year: 2021
+  source: Frontiers
+  title: 'A Sound Prediction: EEG-Based Neural Synchrony Predicts Online Music Streams'
+  title-short: A Sound Prediction
+  type: article-journal
+  URL: https://www.frontiersin.org/articles/10.3389/fpsyg.2021.672980
+  volume: '12'
+output:
+  html_document:
+    df_print: kable
+    code_folding: hide
+    code_download: true
+---
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, results = "asis")
+
+loadPackages <- function() {
+    suppressPackageStartupMessages({
+        library(imotionsApi)
+        library(data.table)
+        library(dplyr)
+        library(stringr)
+        library(stringi)
+        library(tidyr)
+        library(zoo)
+        library(kableExtra)
+    })
+}
+
+loadPackages()
+library(parallel)
+```
+
+```{r Parameters, purl = FALSE}
+start_time <- Sys.time()
+
+upload_data <- TRUE
+
+# Making sure parameters are of the good format
+unlockBinding("params", environment())
+params$window_size <- as.numeric(params$window_size) # window length (in samples) for the ISC.
+params$window_overlap <- as.numeric(params$window_overlap) # window overlap (in %) for the ISC.
+params$quality_threshold <- as.numeric(params$quality_threshold) # signal quality threshold (in %) for the ISC.
+```
+
+```{r Functions common to all aggregation scripts, purl = FALSE}
+#' Helper function to display information in the html report (blue rendering).
+#'
+#' @param text The information text to display.
+#'
+htmlInfo <- function(text) {
+    cat("<div class='alert alert-info'><span class='glyphicon glyphicon-info-sign'></span>", paste("Info:", text),
+        "</div>\n")
+}
+
+
+#' Helper function to display warning in the html report (orange rendering).
+#'
+#' @param text The warning text to display.
+#'
+htmlWarning <- function(text) {
+    cat("<div class='alert alert-warning'><span class='glyphicon glyphicon-flash'></span>", paste("Warning:", text),
+        "</div>\n")
+}
+
+
+#' Helper function to check if a data.table is not null and has at least one row.
+#'
+#' @param dt A data.table to check.
+#'
+#' @return A boolean set to TRUE if the data.table is not null and has at least one row.
+isValid <- function(dt) {
+    return(!is.null(dt) && (nrow(dt) > 0))
+}
+
+
+#' Helper function to find sensor matching a string pattern for further computation.
+#'
+#' @param study An imStudy object as returned from \code{\link{imotionsApi::imStudy}}.
+#' @param respondent An imRespondent object as returned from \code{\link{imotionsApi::getRespondents}}.
+#' @param stimulus An imStimulus object as returned from \code{\link{imotionsApi::getStimuli}}.
+#' @param sensor_matching_pattern A string to match when retrieving a sensor.
+#' @param selectedSensorName selectedSensorName from software dropdown - cloud value is empty and we use autodetection
+#' @param multiple_device A boolean indicating if multiple device should be aggregated together.
+#'
+#' @return A data.table containing sensors that matched the string pattern.
+findSensorsAggregation <- function(study, respondent, stimulus, sensor_matching_pattern, selectedSensorName,
+                                   multiple_device = FALSE) {
+
+    # get sample information for this stimulus
+    sensors <- tryCatch({
+        as.data.table(imotionsData::listRespondentSamples(study$connection, study$id, stimulus$id, respondent$id))
+    },
+    error = function(e) {
+        message(paste("Could not retrieve processed data for respondent", respondent$name, "& stimulus", stimulus$name))
+        NULL
+    })
+
+    if (!isValid(sensors)) return(NULL)
+
+    sensors <- sensors[!is.na(dataUrl), ]
+
+    # Get processed data ids (if available)
+    sensor_idx <- grepl(sensor_matching_pattern, sensors$name)
+    sensors <- sensors[sensor_idx, ]
+
+    # If no sensors found matching the pattern, we won't compute any metric
+    if (nrow(sensors) == 0)  return(NULL)
+
+    if (multiple_device) {
+        # in case of multiple sensors we select all data found
+        sensor_idx <- seq_len(nrow(sensors))
+    } else {
+        # in case a device has been selected, we only run the aggregation on this one
+        if (params$selectedSensorName != "") {
+            # Reformat the selected device name
+            device_info <- unlist(strsplit(selectedSensorName, "||", fixed = TRUE))
+            instance <- unique(strsplit(paste(device_info[1], device_info[3], device_info[2]), "\\s+")[[1]])
+            expected_device <- paste(instance, collapse = " ")
+
+            # Select sensor matching the selected sensor
+            sensor_idx <- grep(expected_device, str_extract(sensors$name, "(?<=\\().*(?=\\))"))
+        } else {
+            # if no device is selected, running it on the first processed signal found
+            sensor_idx <- 1
+        }
+    }
+
+    sensors <- sensors[sensor_idx, ]
+
+    # Tag each sensorIds with the device name
+    attr(sensors, "device") <- str_extract(sensors$name, "(?<=\\().*(?=\\))")
+    return(sensors)
+}
+
+#' Main function to retrieve processed data for each respondent.
+#'
+#' @param params The list of parameters as given to the script.
+#' @param study An imStudy object as returned from \code{\link{imotionsApi::imStudy}}.
+#' @param respondent An imRespondent object as returned from \code{\link{imotionsApi::getRespondents}}.
+#' @param stimulus An imStimulus object as returned from \code{\link{imotionsApi::getStimuli}}.
+#' @param sensor_matching_pattern A string to match when retrieving a sensor.
+#' @param FUN_retrieve_data Name of the function to use to retrieve data.
+#'
+#' @return A data.table containing the processed data for each respondent for aggregation later.
+mainRetrieveData <- function(params, study, respondent, stimulus, sensor_matching_pattern, FUN_retrieve_data) {
+    # Retrieve sensors available for this respondent
+    sensors <- findSensorsAggregation(study, respondent, stimulus, sensor_matching_pattern, params$selectedSensorName,
+                                      params$multiple_device)
+
+    # Retrieve intervals for this stimulus
+    intervals <- getRespondentIntervals(study, respondent, c("Stimulus", "Scene"))[id %in% stimulus$id, ]
+
+    if (!isValid(sensors)) return(data.table())
+
+    all_sensors_data <- rbindlist(by(sensors, seq_len(nrow(sensors)), function(sensor) {
+            data <- FUN_retrieve_data(study, sensor, intervals)
+
+            if (!isValid(data)) return(data.table())
+
+            # Retrieving sensor used
+            device <- attr(sensors, "device")[which(sensor$name == sensors$name)]
+            data$respondentId <- paste0(respondent$id, "_", device)
+            data$device <- device
+            return(data)
+    }))
+
+    return(all_sensors_data)
+}
+
+
+#' Modified version of the bind_rows function to be able to differentiate NA values from merge induced values.
+#'
+#' @param ...
+#'
+#' @return A merged table (data.table) filled by -123455 instead of NA values.
+bind_rows_fill <- function(...) {
+    dots <- rlang::list2(...)
+
+    if (length(dots) > 1) {
+        headers <- unique(unlist(lapply(dots, names)))
+        to_fill <- unname(which(lengths(dots) != length(headers) & lengths(dots) > 0))
+
+        if (length(to_fill) > 0) {
+            for (i in to_fill) {
+                # Fill bind_rows values with -123456 to differentiate them from normal NA values and remove them later.
+                columns_to_add <- setdiff(headers, names(dots[[i]]))
+                suppressWarnings(dots[[i]][, eval(columns_to_add) := -123456])
+            }
+        }
+    }
+
+    return(bind_rows(dots))
+}
+
+
+#' Helper function to map and rbindlist results.
+#'
+#' @param data A data.table on which we want to iterate.
+#' @param indices The indices to provide to the by function to iterate on.
+#' @param FUN The function to apply.
+#' @param keep_list A boolean indicating if single list item should be kept in a list or not.
+#'
+#' @return A merged table (data.table) of results.
+mapBindRows <- function(data, indices, FUN, keep_list = FALSE) {
+    results <- do.call(Map, c(f = bind_rows_fill, by(data, indices, function(idx) {
+        res <- FUN(idx)
+
+        if (inherits(res, "list")) {
+            return(res)
+        } else {
+            return(list(res))
+        }
+    }, simplify = FALSE)))
+
+    if (length(results) == 1 && !keep_list) {
+        return(results[[1]])
+    } else {
+        return(results)
+    }
+}
+```
+
+```{r Functions specific to this export, purl = TRUE}
+#' Check and modify a percentage parameter used for the ISC computation if it is out of range.
+#'
+#' @param percentage_param A percentage parameter as given to the script.
+#' @param param_name The name of the parameter to issue a warning if needed.
+#'
+#' @return The modified parameter to use for the ISC computation.
+checkPercentageParameter <- function(percentage_param, param_name) {
+    if (!percentage_param %between% c(0, 100)) {
+        percentage_param <- pmax(pmin(percentage_param, 100), 0)
+        htmlWarning(paste(param_name, "is out of range, capping it to the nearest valid value:", percentage_param))
+    }
+
+    return(percentage_param)
+}
+
+
+
+#' Retrieve the PSD data for EEG Intersubject Correlation computation.
+#'
+#' @param study An imStudy object as returned from \code{\link{imotionsApi::imStudy}}.
+#' @param sensor The sensor to retrieve.
+#' @param intervals An imIntervalList object as returned from \code{\link{imotionsApi::getRespondentIntervals}}.
+#'
+#' @return A data.table with pre-computed PSD data.
+retrievePsdDataIsc <- function(study, sensor, intervals) {
+    data <- setDT(imotionsData::getSampleData(study$connection, study$id, unique(intervals$id),
+                                              intervals$respondent[[1]]$id, sampleId = sensor$id))
+
+    # Electrodes need to be re-ordered in case some data was missing for some respondents and not others
+    names_electrodes <- unique(str_split(str_subset(names(data), fixed(" (dB)")), " ", simplify = TRUE)[, 1])
+    names_electrodes <- str_sort(head(names_electrodes, -1), numeric = TRUE)
+    ordered_names <- unlist(lapply(names_electrodes, function(x) names(data)[grepl(paste0("^", x, " "), names(data))]))
+
+    # extract PSD part only
+    data <- data[, c("TimeStamp", str_subset(ordered_names, fixed("(dB)"))), with = FALSE]
+    setnames(data, 1, "Timestamp")
+
+    # change format so the frequencies go to a separate column
+    data <- pivot_longer(data, cols = starts_with(names_electrodes), names_to = c(".value", "Powerband"),
+                         names_pattern = "(.*?)\\s(.*?)\\s")
+
+    setcolorder(data, c("Timestamp", names_electrodes, "Powerband"))
+    return(data)
+}
+
+
+
+#' Filter the PSD data to remove respondents with a signal quality too low.
+#'
+#' @param psd_data A data.table with the PSD data for all respondents that needs to be filtered.
+#' @param quality_threshold A quality percentage below which respondents should be excluded from ISC.
+#' @param respondents An imRespondentList object as returned from \code{\link{imotionsApi::getRespondents}}.
+#'
+#' @return A list containing the filtered PSD data.table containing only respondents with a good enough signal quality
+#'         and a table with their quality metrics.
+filterQualityPSD <- function(psd_data, quality_threshold, respondents) {
+    # Filter respondents based on data quality
+    frequencies <- unique(psd_data$Powerband)
+    powerband_data <- psd_data[Powerband %in% frequencies[1], -c("Timestamp", "Powerband", "device")]
+    ISC_respondents <- unique(powerband_data$respondentId)
+
+    info_respondent <- stri_replace_all_fixed(paste0(str_replace_all(ISC_respondents, "_", " ("), ")"), respondents$id,
+                                              respondents$name, vectorize_all = FALSE)
+
+    # If only one device detected, we remove it from the respondent names for warning and signal quality
+    device_regex <- "\\s\\([^()]+\\)"
+
+    if (length(unique(str_extract_all(info_respondent, device_regex))) == 1) {
+        info_respondent <- sub(device_regex, "\\1", info_respondent)
+    }
+
+    quality_score <- data.table(rbind(by(ISC_respondents, seq_along(ISC_respondents), function(ISC_respondent) {
+        respondent_data <- powerband_data[respondentId %in% ISC_respondent, -"respondentId"]
+        return(sum(is.na(respondent_data)) / prod(dim(respondent_data)) * 100)
+    })))
+
+    names(quality_score) <- info_respondent
+    to_keep <- c(quality_score <= quality_threshold)
+
+    if (any(!to_keep)) {
+        if (sum(to_keep) == 0) {
+            htmlWarning("All respondents had too much missing PSD data.")
+        } else {
+            htmlWarning(paste("Some respondents had too much missing PSD data and got excluded from the analysis:",
+                        paste(info_respondent[!to_keep], collapse = ", ")))
+        }
+    }
+
+    setattr(psd_data, "frequencies", frequencies)
+    return(list("data" = psd_data[respondentId %in% ISC_respondents[to_keep], ], "metrics" = quality_score))
+}
+
+
+
+#' Main function to compute EEG Intersubject Correlation across respondents.
+#'
+#' @param params The list of parameters as given to the script.
+#' @param psd_data A data.table containing the PSD processed data for each respondent.
+#'
+#' @return A data.table with the EEG Intersubject Correlation aggregated for each timepoint.
+mainAggregationPsdIsc <- function(params, psd_data) {
+    diff_ts <- median(diff(unique(psd_data$Timestamp)))
+    psd_data <- psd_data[, -"Timestamp"]
+    frequencies <- attr(psd_data, "frequencies")
+    name_cols <- c("Timestamp", paste("Intersubject Correlation", frequencies))
+    respondents <- unique(psd_data$respondentId)
+
+    # If less than two respondents with good enough data we need to skip the ISC computation
+    if (length(respondents) < 2) {
+            htmlWarning(paste("Not enough respondents to compute Intersubject Correlation,",
+                              "at least two respondents with valid data are needed."))
+
+            ISC_data <- data.table(0, t(rep(NA_real_, length(frequencies))))
+            setnames(ISC_data, name_cols)
+            return(ISC_data)
+    }
+
+    # For the respondents with enough data quality, compute ISC
+    respondents_combination <- t(combn(respondents, 2))
+
+    # Compute sample overlap
+    sample_overlap <- max(1, floor(params$window_size - params$window_overlap * params$window_size / 100))
+
+    ISC_data <- do.call(cbind, by(frequencies, seq_along(frequencies), function(frequency) {
+        psd_data <- psd_data[Powerband == frequency, -"Powerband"]
+
+        results <- mapBindRows(respondents_combination, seq_len(nrow(respondents_combination)),
+                               function(respondent_ids) {
+
+            I <- psd_data[respondentId == respondent_ids[1], -"respondentId"]
+            J <- psd_data[respondentId == respondent_ids[2], -"respondentId"]
+            rows_idx <- seq_len(min(nrow(I), nrow(J)))
+
+            if (length(rows_idx) > 0 && max(rows_idx) >= params$window_size) {
+                results <- rollapply(rows_idx, width = params$window_size, by = sample_overlap, function(idx) {
+                    return(abs(cor(unlist(I[idx, ]), unlist(J[idx, ]), use = "na.or.complete")))
+                })
+            } else {
+                results <- NA_real_
+            }
+
+            results <- as.list(as.data.table(results))
+            results <- lapply(results, function(x) data.table(t(x)))
+            return(results)
+        })
+
+        # Set back missing windows value to NA (if any) and aggregate Intersubject Correlation
+        results[results == -123456] <- NA
+        return(colMeans(results, na.rm = TRUE))
+    }, simplify = FALSE))
+
+    # Generate timestamps based on the data information
+    ISC_data <- as.data.table(ISC_data)
+    timestamps <- seq(diff_ts * (params$window_size / 2), by = diff_ts * sample_overlap, length.out = nrow(ISC_data))
+
+    ISC_data <- cbind(timestamps, ISC_data)
+    setnames(ISC_data, name_cols)
+    return(ISC_data)
+}
+```
+
+```{r Retrieve data informations, purl = FALSE}
+# Get information about the study ======================================================================================
+connection <- imConnection(params$token)
+study <- imStudy(connection, params$studyId)
+stimulus <- getStimulus(study, params$stimulusId)
+segment <- getSegment(study, params$segmentId)
+respondents <- getRespondents(study, stimulus = stimulus, segment = segment)
+```
+
+```{r Cluster creation, purl = FALSE}
+# Prepare cluster for parallel retrieving of each respondent metrics ===================================================
+cl <- makeCluster(min(nrow(respondents), detectCores() - 1), type = "SOCK")
+clusterExport(cl, as.list(unique(c(ls(.GlobalEnv), ls(environment())))), envir = environment())
+
+invisible(clusterEvalQ(cl, {
+    loadPackages()
+    arrow::set_cpu_count(1)
+}))
+```
+
+```{r Retrieve PSD data for each respondent, purl = FALSE}
+# Get PSD processed data for each respondent/device ===================================================================
+psd_data <- bind_rows(clusterApplyLB(cl, seq_len(nrow(respondents)), function(idx) {
+    mainRetrieveData(params, study, respondents[idx, ], stimulus,
+                     sensor_matching_pattern = "Power Spectral Density \\(",
+                     FUN_retrieve_data = retrievePsdDataIsc)
+}))
+
+if (nrow(psd_data) == 0) {
+    htmlWarning("No PSD Signal detected. Please make sure that the Power Spectral Density Notebook was
+                previously run and PSD data was computed.")
+
+    stopCluster(cl)
+    knitr::knit_exit()
+}
+```
+
+```{r Aggregate data and upload results, purl = FALSE}
+# Verify the percentage parameters
+params$window_overlap <- checkPercentageParameter(params$window_overlap, "Window overlap percentage")
+params$quality_threshold <- checkPercentageParameter(params$quality_threshold, "Signal quality threshold")
+
+if (params$multiple_device) {
+    sensor_instance <- "Multiple device"
+} else {
+    sensor_instance <- unique(psd_data$device)
+}
+
+# Filter respondents based on data quality
+quality_results <- filterQualityPSD(psd_data, params$quality_threshold, respondents)
+psd_data <- quality_results$data[, -"device"]
+
+# Aggregate PSD data to get intersubject correlation
+ISC_data <- mainAggregationPsdIsc(params, psd_data)
+
+# upload aggregated PSD data
+if (upload_data) {
+    group_name <- paste0(params$flowName, " (", sensor_instance, ")")
+    metadata <- data.table("Group" = c("", rep(group_name, ncol(ISC_data) - 1)))
+
+    # Add the device and respondent base to the parameters metadata so it can be retrieved by exports
+    params$Device <- sensor_instance
+    params$RespondentBase <- nrow(respondents)
+    params$MetricsBase <- length(unique(psd_data$respondentId))
+    sample_name <- script_name <- "EEG Intersubject Correlation"
+
+    ul_data <- uploadSensorData(params, study, ISC_data, segment, sample_name, script_name, metadata, stimulus)
+}
+```
+
+### Study: `r study$name`
+
+### Stimulus: `r stimulus$name`
+
+### Sensor: `r sensor_instance`
+
+------------------------------------------------------------------------
+
+### Methods
+
+Based on the methods described in [@leeuwis2021], this R notebook has performed the following steps on the PSD data on the stimulus of interest:
+
+-   Retrieval of the PSD data (in dB) for each respondent and filtering of respondents with a percentage of missing data above `r params$quality_threshold`%.
+
+-   For each powerband (N_powerbands), computation of the absolute pearson correlation score for each pair of respondents (N_pairs) and each window of `r params$window_size` samples with a `r params$window_overlap`% overlap (N_windows) only taking data up to the minimal duration of exposure in case the two respondents were not exposed to the same stimulus for the same amount of time (resulting dimension N_powerbands \* N_pairs \* N_windows). Incomplete windows at the beginning and end of each stimulus are excluded from the analysis. Missing values are treated by case-wise deletion.
+
+-   Aggregating these correlation scores across respondent pairs (N_powerbands \* N_windows).
+
+-   Calculating the final EEG Intersubject Correlation metric for each powerband by aggregating these correlation scores over time.
+
+------------------------------------------------------------------------
+
+<br> <br>
+
+### Percentage of missing PSD data (nb of samples missing / nb total of samples)
+
+This percentage is a value ranging from 0 (good signal with no sample missing) to 100 (bad signal with all samples missing).
+
+```{r Percentage of missing PSD data, results='asis', purl = FALSE}
+if (!is.null(quality_results$metrics)) {
+    percentage_valid <- quality_results$metrics
+    n_tables <- ceiling(ncol(percentage_valid) / 5)
+
+    # Splitting channels in different tables to have a nicer output
+    for (i in seq(0, n_tables - 1)) {
+        column_idx <- seq((i * 5) + 1, min(ncol(percentage_valid), (i * 5) + 5))
+
+        table <- percentage_valid[, ..column_idx] %>%
+            knitr::kable("html", digits = 3, align = "c") %>%
+            row_spec(row = 0, background = "#EBF5FB")  %>%
+            column_spec(column_idx - i * 5, width = "200px") %>%
+            kable_styling(font_size = 14, position = "left", bootstrap_options = c("hover", "condensed", "responsive"),
+                          full_width = FALSE)
+
+        print(table)
+    }
+} else {
+    htmlInfo("No raw data available.")
+}
+
+end_time <- Sys.time()
+time_taken <- end_time - start_time
+```
+
+```{r End computation time, purl = FALSE}
+end_time <- Sys.time()
+time_taken <- end_time - start_time
+```
+
+*Computation started at `r format(start_time, usetz = TRUE)` / Notebook execution time: `r format(time_taken)`*
+
+### References
+
+```{r license, echo = FALSE}
+# The contents of this notebook are licensed under the MIT license:
+# Copyright (c) 2018-2023 iMotions
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+```

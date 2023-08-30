@@ -1,0 +1,360 @@
+---
+title: AFFDEX Raw Data Statistics Export (Adapted)
+description: Produces file export for AFFDEX Statistics on raw data. The notebook calculates parametric (mean, var, sd), robust (quantiles, IQR) and moment (moment, skewness, kurtoses) statistics for chosen stimuli, scenes, annotations and/or fragments.
+helpUrl: https://go.imotions.com/R_FEAstatisticsExport
+dependencies:
+  sensor: "AFFDEX"
+params:
+    token: "xxxxx"
+    studyId: "xxxxx"
+    outputDirectory: "Facial Coding"
+    metrics_wanted:
+        label: "Included statistics"
+        value: "Parametric"
+        input: select
+        choices: ["Parametric", "Robust", "Moments", "Only Emotions"]
+        multiple: yes
+    percentiles:
+        label: "Percentiles for parametric in range 0-1"
+        value: "0, 0.25, 0.50, 0.75, 1"
+        input: text
+    order:
+        label: "Order of moment"
+        value: "5"
+        input: select
+        multiple: yes
+        choices: ["5", "6", "7", "8", "9", "10"]
+    stimuli:
+        label: "Include events"
+        value: "Stimuli"
+        choices: ["Stimuli", "Scenes", "Annotations"]
+        input: select
+        multiple: yes
+    fragments:
+        label: "Include fragments of selected events (Scenes/Annotations)"
+        value: FALSE
+        input: checkbox
+output:
+    html_document:
+        df_print: "kable"
+        code_folding: "hide"
+        code_download: true
+        theme: "default"
+---
+
+```{r global_options, prl = TRUE, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, results = "asis")
+
+library(imotionsApi)
+library(data.table)
+library(stringr)
+library(dplyr)
+library(moments)
+```
+
+```{r, purl = TRUE}
+start_time <- Sys.time()
+outputDirectory <- params$outputDirectory
+
+# Making sure parameters are of the good format
+unlockBinding("params", environment())
+params$stimuli <- str_replace_all(params$stimuli, c("Stimuli" = "Stimulus", "Scenes" = "Scene",
+                                                    "Annotations" = "Annotation"))
+```
+
+```{r Functions, purl = TRUE}
+
+warningHtml <- function(text) {
+    cat("<div class='alert alert-warning'><span class='glyphicon glyphicon-flash'></span> ", paste("Warning:", text),
+        "</div>\n")
+}
+
+extract_string <- function(string, pattern) {
+    percent <- suppressWarnings(as.numeric(unlist(str_split(str_remove_all(string, " "), pattern))))
+
+    if (any(is.na(percent))) {
+        warningHtml("Please verify your entered values for percentile and check that they are seperated by comma.")
+        knitr::knit_exit()
+    }
+
+    return(percent)
+}
+
+sanitize_string <- function(string) {
+    safeString <- gsub("[^[:alnum:]]", "_", string)
+    safeString <- gsub("_+", "_", safeString)
+    safeString
+}
+
+#' Add zero padding in front of numbers in a vector of strings, based on the maximum number detected in the vector.
+#'
+#' @param vector A vector of strings containing numbers
+#'
+#' @return A vector of strings containing zero padded numbers
+zeroPadNumber <- function(vector) {
+    extractedNumbers <- str_extract(vector, "(\\d+)(?!.*\\d)")
+    paddedNumbers <- str_pad(extractedNumbers, width = max(nchar(extractedNumbers)), pad = "0")
+    paddedVector <- str_replace(vector, "(\\d+)(?!.*\\d)", paddedNumbers)
+    return(paddedVector)
+}
+
+#' Helper function to move around columns.
+#'
+#' @param data A data.table with column to be reordered.
+#' @param colNamesToMove Names of one or more columns to move around.
+#' @param where Location where the column(s) should be moved ("first", "last", "before" or "after").
+#' @param colNameAnchoring Optional: for "before" or "after" location, the column name to which it should be appended.
+#'
+#' @return The reordered data.table.
+moveColumns <- function(data, colNamesToMove, where = c("first", "last", "before", "after"), colNameAnchoring = NULL) {
+    temp <- setdiff(names(data), colNamesToMove)
+    reorderedData <- switch(
+        where,
+        first = setcolorder(data, c(colNamesToMove, temp)),
+        last = setcolorder(data, c(temp, colNamesToMove)),
+        before = {
+            order <- append(temp, values = colNamesToMove, after = (match(colNameAnchoring, temp) - 1))
+            setcolorder(data, order)
+        },
+        after = {
+            order <- append(temp, values = colNamesToMove, after = (match(colNameAnchoring, temp)))
+            setcolorder(data, order)
+        })
+
+    return(reorderedData)
+}
+
+
+#' Helper function to compute statistics on a signal.
+#'
+#' @param x A vector containing the signal of interest.
+#' @param percentiles The percentiles for which we want to compute statistics.
+#'
+#' @return A vector containing all statistics for the signal of interest.
+computeSignalStatistics <- function(x, percentiles) {
+    c(mean(x, na.rm = TRUE), sd(x, na.rm = TRUE), var(x, na.rm = TRUE), max(x, na.rm = TRUE),
+      quantile(x, probs = percentiles, na.rm = TRUE), IQR(x, na.rm = TRUE),
+      all.moments(x, order.max = 10, na.rm = TRUE), skewness(x, na.rm = TRUE), kurtosis(x, na.rm = TRUE))
+}
+
+#' Get AFFDEX statistics for the interval of interest.
+#'
+#' @param data The AFFDEX data on which we want to compute statistics.
+#' @param intervals An imIntervalList object as returned from \code{\link{imotionsApi::getRespondentIntervals}}.
+#' @param percentiles The percentiles for which we want to compute statistics.
+#'
+#' @return A data.table containing metrics for all wanted fragments/intervals
+getIntervalsStatistics <- function(data, intervals, percentiles) {
+    # Truncate the data for the interval of interest and compute statistics
+    fragment <- truncateSignalsByIntervals(data, intervals)
+
+    metrics <- data.table(t(apply(fragment[, -1], 2,  computeSignalStatistics, percentiles)))
+
+    names(metrics) <- c("mean", "standard deviation", "variance", "max", paste0(percentiles * 100, "th percentile"),
+                        "Interquartile range", paste0(seq(from = 0, to = 10), "th-order moment"), "skewness",
+                        "kurtosis")
+
+    return(metrics)
+}
+
+#' Get metrics for the interval/respondent used.
+#'
+#' @param intervals An imIntervalList object as returned from \code{\link{imotionsApi::getRespondentIntervals}}.
+#'
+#' @return A data.table row contaning metrics about the respondent and interval used.
+getGlobalMetricsInfo <- function(intervals) {
+    respondent_metrics <- data.table(intervals$respondent[[1]][, c("name", "gender", "age", "group")])
+
+    interval_metrics <- unique(data.table(intervals$type, intervals$name, intervals$parentName))
+
+    metrics <- cbind(respondent_metrics, interval_metrics)
+
+    names(metrics) <- c("Respondent Name", "Gender", "Age", "Group", "Type", "Label", "Parent Stimulus")
+
+    return(metrics)
+}
+
+
+
+#' For a specific respondent data and a specific stimulus/scene/annotation, compute metrics and aggregate them.
+#'
+#' @param data A data.table containing the data from which we want to compute metrics.
+#' @param intervals An imIntervalList object as returned from \code{\link{imotionsApi::getRespondentIntervals}}.
+#' @param percentiles The percentiles for which we want to compute statistics.
+#' @param includeFragments A boolean indicating if we should include scenes/annotations fragments.
+#'
+#' @return A data.table with all metrics for this respondent/interval combination.
+computeFeaMetricsByInterval <- function(data, intervals, percentiles, includeFragments = FALSE) {
+    # Get metrics for the whole interval
+    global_metrics <- getGlobalMetricsInfo(intervals)
+    metrics <- cbind(global_metrics, getIntervalsStatistics(data, intervals, percentiles))
+
+    if (nrow(intervals) > 1 && includeFragments) {
+        # In case of multiple fragments/intervals in a scene/annotation, metrics must be computed for each chunk
+        metrics_intervals <- bind_rows(lapply(seq_len(nrow(intervals)), function(idx) {
+            interval <- intervals[idx, ]
+            global_metrics_interval <- getGlobalMetricsInfo(interval)
+
+            # Changing type/label of intervals and adding their metrics
+            global_metrics_interval[, Label := fcase(Type == "Annotation", paste0(Label, " (instance ", idx, ")"),
+                                                     Type == "Scene", paste0(Label, " (fragment ", idx, ")"))]
+
+            global_metrics_interval[, Type := fcase(Type == "Annotation", "Annotation (Instance)",
+                                                    Type == "Scene", "Scene (Fragment)")]
+
+            metrics_interval <- cbind(global_metrics_interval, getIntervalsStatistics(data, interval, percentiles))
+        }))
+
+        metrics <- rbind(metrics, metrics_intervals)
+    }
+
+    return(metrics)
+}
+
+#' Main function to retrieve AFFDEX data for each respondent and compute statistics on the data.
+#'
+#' @param params The list of parameters as given to the script.
+#' @param study A study, as returned by imotionsApi::getStudy.
+#' @param respondent A respondent, as returned by imotionsApi::getRespondents.
+#'
+#' @return A data.table with the metrics for this respondent
+mainRespondentFeaProcessing <- function(params, study, respondent) {
+    # Now it retrieves all sensors for a respondent of interest
+    sensors <- getSensors(study, respondent)
+    sensors <- sensors[!is.na(dataUrl), ]
+    sensor <- sensors[name == "Affectiva AFFDEX", ]
+
+    if (is.null(sensor)) {
+        return(NULL)
+    }
+
+    data <- getSensorData(study, sensor)
+    data$SampleNumber <- NULL
+    data <- filter(data, "Interocular Distance" > 0)
+
+    intervals <- getRespondentIntervals(study, respondent, type = params$stimuli)
+
+    if (is.null(intervals)) {
+        message(paste("No", paste(params$stimuli, collapse = "/"), "found for respondent", respondent$name,
+                      ", no metrics generated..."))
+
+        return(NULL)
+    }
+
+    # All metrics are now calculated for the selected intervals of interest
+    percentiles <- c(extract_string(params$percentiles, ","))
+
+    metrics <- rbindlist(by(intervals, factor(intervals$id, levels = unique(intervals$id)), function(intervals) {
+            computeFeaMetricsByInterval(data, intervals, percentiles, params$fragments)
+    }))
+
+    # Delete unwanted metrics
+    if (!"Parametric" %in% params$metrics_wanted) {
+        metrics <- select(metrics, -c("mean", "standard deviation", "variance", "max"))
+    }
+
+    if (!"Robust" %in% params$metrics_wanted) {
+        metrics <- select(metrics, -c(contains("percentile"), "Interquartile range"))
+    }
+
+    if (!"Moments" %in% params$metrics_wanted) {
+        metrics <- select(metrics, -c(contains("th-order moment"), skewness, kurtosis))
+    } else {
+        order_choice <- c(paste0(params$order, "th-order moment"))
+        metrics <- select(metrics, -c(setdiff(names(metrics)[names(metrics) %like% "th-order moment"], order_choice)))
+    }
+
+    # Add information about the facial markers
+    metrics$`Facial Marker` <- rep(names(data)[-1], nrow(metrics) / length(names(data)[-1]))
+
+    metrics <- moveColumns(metrics, "Facial Marker", "after", "Label")
+    metrics %>% mutate_if(is.numeric, ~round(., 2))
+    
+    if (!"Only emotions" %in% params$metrics_wanted) {
+      emotion <- c("Anger", "Sadness", "Disgust", "Joy", "Surprise", "Fear", 
+             "Contempt", "Engagement", "Attention", "Sentimentality", "Confusion")
+
+      metrics <- metrics[metrics$`Facial Marker` %in% emotion, ]
+    }
+
+
+    return(metrics)
+}
+
+```
+
+```{r Retrieve data informations, purl = FALSE, include=FALSE}
+# Get information about the study
+studyId <- params$studyId
+connection <- imotionsApi::imConnection(params$token)
+study <- imotionsApi::imStudy(connection, studyId)
+respondents <- imotionsApi::getRespondents(study)
+
+studyName <- study$name
+
+if (is.null(outputDirectory) || outputDirectory == "") {
+    outputDirectory <- paste0("AFFDEX_Raw_Data_Statistics_", sanitize_string(studyName))
+    message(paste("Output directory parameter not provided. Writing to", outputDirectory))
+    outputZip <- paste0(outputDirectory, ".zip")
+}
+
+dir.create(outputDirectory)
+```
+
+```{r results="asis"}
+metrics <- do.call(rbind, by(respondents, seq_len(nrow(respondents)), function(respondent) {
+    mainRespondentFeaProcessing(params, study, respondent)
+}))
+
+if (is.null(metrics) || nrow(metrics) == 0) {
+    message("No AFFDEX Raw Data Statistics found for this study, no export generated...")
+    quit()
+}
+
+# Pad annotations/scenes instances with leading zero
+metrics[Type %like% "Instance|Fragment", "Label"] <- zeroPadNumber(metrics[Type %like% "Instance|Fragment", ]$Label)
+
+createExport(study, metrics, outputDirectory, fileName = "AFFDEX_Raw_Data_Statistics.csv")
+
+outputFile <- paste0("AFFDEX_Raw_Data_Statistics_", sanitize_string(studyName), ".zip")
+
+if (exists("outputZip")) {
+    utils::zip(outputZip, outputDirectory)
+    filePath <- outputZip
+} else {
+    filePath <- file.path(outputDirectory, "AFFDEX_Raw_Data_Statistics.csv")
+}
+
+```
+
+<a class='btn btn-default' href='`r filePath`'> Download AFFDEX Raw Data Statistics Export</a>
+
+```{r, purl = FALSE}
+end_time <- Sys.time()
+time_taken <- end_time - start_time
+```
+
+*Computation started at `r format(start_time, usetz = TRUE)` / Notebook execution time: `r format(time_taken)`*
+
+```{r license, echo = FALSE}
+# The contents of this notebook are licensed under the MIT license:
+# Copyright (c) 2018 iMotions
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+```
