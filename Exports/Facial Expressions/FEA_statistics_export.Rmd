@@ -272,7 +272,7 @@ mainRespondentFeaProcessing <- function(params, study, respondent) {
     
     if (!"Only emotions" %in% params$metrics_wanted) {
       emotion <- c("Anger", "Sadness", "Disgust", "Joy", "Surprise", "Fear", 
-             "Contempt", "Engagement", "Attention", "Sentimentality", "Confusion")
+             "Contempt", "Engagement", "Attention", "Sentimentality", "Confusion", "Valence")
 
       metrics <- metrics[metrics$`Facial Marker` %in% emotion, ]
     }
